@@ -69,8 +69,8 @@ fn get_rules(argument: &[Value]) -> Result<Vec<Rule>> {
 
                 Os {
                     name,
-                    arch,
                     version,
+                    arch,
                 }
             })
         });
@@ -82,9 +82,12 @@ fn get_rules(argument: &[Value]) -> Result<Vec<Rule>> {
             },
             features,
             os,
-            value: item["value"]
-                .as_array()
-                .map(|str_vec| str_vec.iter().map(|x| x.to_string()).collect()),
+            value: item["value"].as_array().map(|str_vec| {
+                str_vec
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            }),
         });
     }
     Ok(rules)
