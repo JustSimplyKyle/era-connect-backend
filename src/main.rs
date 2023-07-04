@@ -1,19 +1,24 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum ActionType {
+    #[serde(rename = "allow")]
     Allow,
+    #[serde(rename = "disallow")]
     Disallow,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum OsName {
+    #[serde(rename = "osx")]
     Osx,
+    #[serde(rename = "windows")]
     Windows,
+    #[serde(rename = "linux")]
     Linux,
 }
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -25,86 +30,91 @@ struct Os {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Rule {
     action: ActionType,
-    features: Option<std::collections::HashMap<String, bool>>,
+    features: Option<HashMap<String, bool>>,
     os: Option<Os>,
     value: Option<Vec<String>>,
 }
 
-fn get_rules(argument: &[Value]) -> Result<Vec<Rule>> {
-    let mut rules: Vec<Rule> = Vec::new();
-    for item in argument.iter() {
-        let object = item["rules"][0]
-            .as_object()
-            .ok_or_else(|| anyhow!("Expected 'rules' to be an array with at least one object."))?;
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct GameFlags {
+    rules: Vec<Rule>,
+    arguments: Vec<String>,
+    additional_arguments: Option<Vec<String>>,
+}
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct JvmFlags {
+    rules: Vec<Rule>,
+    arguments: Vec<String>,
+    additional_arguments: Option<Vec<String>>,
+}
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+struct AssetIndex {
+    id: String,
+    sha1: String,
+    size: u64,
+    #[serde(rename = "totalSize")]
+    total_size: u64,
+    url: String,
+}
 
-        let features = object.get("features").map(|y| {
-            y.as_object()
-                .unwrap()
-                .iter()
-                .map(|x| (x.0.clone(), x.1.as_bool().unwrap()))
-                .collect::<HashMap<_, _>>()
-        });
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+struct DownloadMetadata {
+    sha1: String,
+    size: u64,
+    url: String,
+}
 
-        let os = object.get("os").and_then(|y| {
-            y.as_object().unwrap().iter().next().map(|(k, v)| {
-                let name = match k.as_str() {
-                    "name" => v.as_str().and_then(|name| match name {
-                        "osx" => Some(OsName::Osx),
-                        "windows" => Some(OsName::Windows),
-                        "arch" => Some(OsName::Linux),
-                        _ => None,
-                    }),
-                    _ => None,
-                };
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+struct Downloads {
+    client: DownloadMetadata,
+    client_mappings: DownloadMetadata,
+    server: DownloadMetadata,
+    server_mappings: DownloadMetadata,
+}
 
-                let arch = match k.as_str() {
-                    "arch" => v.as_str().map(String::from),
-                    _ => None,
-                };
-
-                let version = match k.as_str() {
-                    "version" => v.as_str().map(String::from),
-                    _ => None,
-                };
-
-                Os {
-                    name,
-                    version,
-                    arch,
-                }
-            })
-        });
-        rules.push(Rule {
-            action: match object.get("action").unwrap().as_str().unwrap() {
-                "allow" => ActionType::Allow,
-                "disallow" => ActionType::Disallow,
-                _ => return Err(anyhow!("Invalid 'action' value.")),
-            },
-            features,
-            os,
-            value: item["value"].as_array().map(|str_vec| {
-                str_vec
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect()
-            }),
-        });
-    }
-    Ok(rules)
+fn get_rules(argument: &mut [Value]) -> Vec<Rule> {
+    argument
+        .iter_mut()
+        .filter(|x| x["rules"][0].is_object())
+        .map(|x| serde_json::from_value(x["rules"][0].take()).unwrap())
+        .collect::<Vec<Rule>>()
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let target = "https://piston-meta.mojang.com/v1/packages/715ccf3330885e75b205124f09f8712542cbe7e0/1.20.1.json";
     let response = reqwest::get(target).await?;
-    let contents: Value = response.json().await?;
+    let mut contents: Value = response.json().await?;
 
-    let game_argument = contents["arguments"]["game"].as_array().unwrap();
-    let game_rules = get_rules(game_argument)?;
+    let game_argument = contents["arguments"]["game"].as_array_mut().unwrap();
 
-    let jvm_argument = contents["arguments"]["jvm"].as_array().unwrap();
-    let jvm_rules = get_rules(jvm_argument)?;
+    let game_flags = GameFlags {
+        rules: get_rules(game_argument),
+        arguments: game_argument
+            .iter()
+            .filter_map(Value::as_str)
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>(),
+        additional_arguments: None,
+    };
 
-    dbg!(game_rules, jvm_rules);
+    let jvm_argument = contents["arguments"]["jvm"].as_array_mut().unwrap();
+    let jvm_flags = JvmFlags {
+        rules: get_rules(jvm_argument),
+        arguments: jvm_argument
+            .iter()
+            .filter_map(Value::as_str)
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>(),
+        additional_arguments: None,
+    };
+
+    let asset_index: AssetIndex = serde_json::from_value(contents["assetIndex"].take())
+        .context("Failed to Serialize assetIndex")?;
+
+    let downloads_list: Downloads = serde_json::from_value(contents["downloads"].take())
+        .context("Failed to Serialize Downloads")?;
+
+    dbg!(downloads_list, asset_index, game_flags, jvm_flags);
     Ok(())
 }
