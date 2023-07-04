@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,83 +30,64 @@ struct Rule {
     value: Option<Vec<String>>,
 }
 
-// struct AssetIndex {
-//     id: String,
-//     sha1: String,
-//     size: f32,
-//     total_size: f32,
-//     url: String,
-// }
-
-// struct LibraryDownload {
-//     path: String,
-//     sha1: String,
-//     size: f32,
-//     url: String,
-// }
-// struct MojangLibrary {
-
-// }
-
-// struct GameArguments {
-
-// }
-// struct JvmArguments {
-
-// }
-fn get_rules(argument: &[Value]) -> Vec<Rule> {
+fn get_rules(argument: &[Value]) -> Result<Vec<Rule>> {
     let mut rules: Vec<Rule> = Vec::new();
     for item in argument.iter() {
-        let object = item["rules"][0].as_object();
-        if let Some(x) = object {
-            let features = x.get("features").map(|y| {
-                y.as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|x| (x.0.clone(), x.1.as_bool().unwrap()))
-                    .collect::<HashMap<_, _>>()
-            });
-            rules.push(Rule {
-                action: match x.get("action").unwrap().as_str().unwrap() {
-                    "allow" => ActionType::Allow,
-                    "disallow" => ActionType::Disallow,
-                    _ => unreachable!(),
-                },
-                features,
-                os: if let Some(y) = x.get("os") {
-                    if let Some(obj) = y.as_object().unwrap().iter().next() {
-                        Some(Os {
-                            name: match obj.0.as_str() {
-                                "name" => match obj.1.as_str().unwrap() {
-                                    "osx" => Some(OsName::Osx),
-                                    "windows" => Some(OsName::Windows),
-                                    "arch" => Some(OsName::Linux),
-                                    _ => unreachable!(),
-                                },
-                                _ => None,
-                            },
-                            arch: match obj.0.as_str() {
-                                "arch" => Some(obj.1.to_string()),
-                                _ => None,
-                            },
-                            version: match obj.0.as_str() {
-                                "version" => Some(obj.1.to_string()),
-                                _ => None,
-                            },
-                        })
-                    } else {
-                        unreachable!();
-                    }
-                } else {
-                    None
-                },
-                value: item["value"]
-                    .as_array()
-                    .map(|str_vec| str_vec.iter().map(|x| x.to_string()).collect()),
-            });
-        }
+        let object = item["rules"][0]
+            .as_object()
+            .ok_or_else(|| anyhow!("Expected 'rules' to be an array with at least one object."))?;
+
+        let features = object.get("features").map(|y| {
+            y.as_object()
+                .unwrap()
+                .iter()
+                .map(|x| (x.0.clone(), x.1.as_bool().unwrap()))
+                .collect::<HashMap<_, _>>()
+        });
+
+        let os = object.get("os").and_then(|y| {
+            y.as_object().unwrap().iter().next().map(|(k, v)| {
+                let name = match k.as_str() {
+                    "name" => v.as_str().and_then(|name| match name {
+                        "osx" => Some(OsName::Osx),
+                        "windows" => Some(OsName::Windows),
+                        "arch" => Some(OsName::Linux),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+
+                let arch = match k.as_str() {
+                    "arch" => v.as_str().map(String::from),
+                    _ => None,
+                };
+
+                let version = match k.as_str() {
+                    "version" => v.as_str().map(String::from),
+                    _ => None,
+                };
+
+                Os {
+                    name,
+                    arch,
+                    version,
+                }
+            })
+        });
+        rules.push(Rule {
+            action: match object.get("action").unwrap().as_str().unwrap() {
+                "allow" => ActionType::Allow,
+                "disallow" => ActionType::Disallow,
+                _ => return Err(anyhow!("Invalid 'action' value.")),
+            },
+            features,
+            os,
+            value: item["value"]
+                .as_array()
+                .map(|str_vec| str_vec.iter().map(|x| x.to_string()).collect()),
+        });
     }
-    rules
+    Ok(rules)
 }
 
 #[tokio::main]
@@ -116,10 +97,10 @@ async fn main() -> Result<()> {
     let contents: Value = response.json().await?;
 
     let game_argument = contents["arguments"]["game"].as_array().unwrap();
-    let game_rules = get_rules(game_argument);
+    let game_rules = get_rules(game_argument)?;
 
     let jvm_argument = contents["arguments"]["jvm"].as_array().unwrap();
-    let jvm_rules = get_rules(jvm_argument);
+    let jvm_rules = get_rules(jvm_argument)?;
 
     dbg!(game_rules, jvm_rules);
     Ok(())
