@@ -72,12 +72,14 @@ struct Downloads {
     server_mappings: DownloadMetadata,
 }
 
-fn get_rules(argument: &mut [Value]) -> Vec<Rule> {
-    argument
+fn get_rules(argument: &mut [Value]) -> Result<Vec<Rule>> {
+    let rules: Result<Vec<Rule>, _> = argument
         .iter_mut()
         .filter(|x| x["rules"][0].is_object())
-        .map(|x| serde_json::from_value(x["rules"][0].take()).unwrap())
-        .collect::<Vec<Rule>>()
+        .map(|x| serde_json::from_value(x["rules"][0].take()))
+        .collect();
+
+    rules.context("Failed to collect/serialize rules")
 }
 
 #[tokio::main]
@@ -89,7 +91,7 @@ async fn main() -> Result<()> {
     let game_argument = contents["arguments"]["game"].as_array_mut().unwrap();
 
     let game_flags = GameFlags {
-        rules: get_rules(game_argument),
+        rules: get_rules(game_argument)?,
         arguments: game_argument
             .iter()
             .filter_map(Value::as_str)
@@ -100,7 +102,7 @@ async fn main() -> Result<()> {
 
     let jvm_argument = contents["arguments"]["jvm"].as_array_mut().unwrap();
     let jvm_flags = JvmFlags {
-        rules: get_rules(jvm_argument),
+        rules: get_rules(jvm_argument)?,
         arguments: jvm_argument
             .iter()
             .filter_map(Value::as_str)
