@@ -1,14 +1,23 @@
 use anyhow::{Context, Result};
+use futures::{io::empty, stream::FuturesUnordered, Stream, StreamExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicUsize, atomic::Ordering, Arc},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::Ordering,
+        atomic::{AtomicBool, AtomicUsize},
+        Arc,
+    },
+    thread::JoinHandle,
+    time::Duration,
 };
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
+    time::{self, Instant},
 };
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -111,7 +120,7 @@ struct LibraryArtifact {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-struct Library {
+pub struct Library {
     downloads: LibraryArtifact,
     name: String,
     rules: Option<Vec<Rule>>,
@@ -124,6 +133,16 @@ fn get_rules(argument: &mut [Value]) -> Result<Vec<Rule>> {
         .collect();
 
     rules.context("Failed to collect/serialize rules")
+}
+
+struct JvmArgs {
+    launcher_name: String,
+    launcher_version: String,
+    classpath: String,
+    classpath_separator: String,
+    primary_jar: String,
+    library_directory: String,
+    game_directory: String,
 }
 
 #[tokio::main]
@@ -144,6 +163,30 @@ async fn main() -> Result<()> {
         additional_arguments: None,
     };
 
+    let asset_index: AssetIndex = serde_json::from_value(contents["assetIndex"].take())
+        .context("Failed to Serialize assetIndex")?;
+
+    let downloads_list: Downloads = serde_json::from_value(contents["downloads"].take())
+        .context("Failed to Serialize Downloads")?;
+
+    let mut library_list: Vec<Library> = serde_json::from_value(contents["libraries"].take())?;
+
+    let logging: LoggingConfig = serde_json::from_value(contents["logging"].take())
+        .context("Failed to Serialize logging")?;
+
+    let main_class: String =
+        serde_json::from_value(contents["mainClass"].take()).context("Failed to get MainClass")?;
+
+    let client_jar = extract_filename(&downloads_list.client.url).unwrap();
+
+    let mut classpath_list = library_list
+        .iter()
+        .map(|x| x.downloads.artifact.path.to_string())
+        .collect::<Vec<String>>();
+
+    classpath_list.push(client_jar.to_string());
+    let classpath = classpath_list.join(":");
+
     let jvm_argument = contents["arguments"]["jvm"].as_array_mut().unwrap();
     let jvm_flags = JvmFlags {
         rules: get_rules(jvm_argument)?,
@@ -154,54 +197,16 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>(),
         additional_arguments: None,
     };
-
-    let asset_index: AssetIndex = serde_json::from_value(contents["assetIndex"].take())
-        .context("Failed to Serialize assetIndex")?;
-
-    let downloads_list: Downloads = serde_json::from_value(contents["downloads"].take())
-        .context("Failed to Serialize Downloads")?;
-    let library_list: Vec<Library> = serde_json::from_value(contents["libraries"].take())?;
-
-    let logging: LoggingConfig = serde_json::from_value(contents["logging"].take())
-        .context("Failed to Serialize logging")?;
-
-    let main_class: String =
-        serde_json::from_value(contents["mainClass"].take()).context("Failed to get MainClass")?;
-
-    use futures::stream::{FuturesUnordered, StreamExt};
-
-    let library_list: Arc<Vec<Library>> = Arc::new(library_list);
-    let counter = Arc::new(AtomicUsize::new(0));
-    let num_libraries = library_list.len();
-
-    let mut library_download_handles = FuturesUnordered::new();
-    for _ in 0..num_libraries {
-        let library_list_clone = Arc::clone(&library_list);
-        let counter_clone = Arc::clone(&counter);
-        let handle = tokio::spawn(async move {
-            let index = counter_clone.fetch_add(1, Ordering::SeqCst);
-            if index < num_libraries {
-                let library = &library_list_clone[index];
-                download_library(library).await
-            } else {
-                Ok(())
-            }
-        });
-        library_download_handles.push(handle);
-    }
-    let total_file_downloads = library_download_handles.len();
-
-    while let Some(handle) = library_download_handles.next().await {
-        handle??;
-        let progress: f64 =
-            1.0 - (library_download_handles.len() as f64 / total_file_downloads as f64);
-        println!(
-            "{:.5}% [{}/{}] file processed",
-            progress * 100.0,
-            total_file_downloads - library_download_handles.len(),
-            total_file_downloads
-        );
-    }
+    let jvm_options = JvmArgs {
+        launcher_name: "era-connect".to_string(),
+        launcher_version: "0.0.1".to_string(),
+        classpath,
+        classpath_separator: ":".to_string(),
+        primary_jar: client_jar.to_string(),
+        library_directory: "./".to_string(),
+        game_directory: "~/.minecraft".to_string(),
+    };
+    parallel_library(library_list).await?;
     // let list_future = download_file(downloads_list.client.url, None);
     // let asset_future = download_file(asset_index.url, Some(generate_unique_filename()));
     // let test_future = download_file(downloads_list.server.url, None);
@@ -209,7 +214,85 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn download_file(url: String, name: Option<String>) -> Result<()> {
+pub async fn parallel_join(
+    handles: &mut FuturesUnordered<tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>>,
+    size_counter: &Arc<AtomicUsize>,
+) -> Result<()> {
+    let total_items = handles.len();
+    let start_time = Instant::now();
+    while let Some(handle) = handles.next().await {
+        let total_bytes = Arc::clone(&size_counter);
+        handle.unwrap()?;
+        let current_bytes = total_bytes.load(Ordering::SeqCst);
+        let elapsed_time = start_time.elapsed().as_secs_f64();
+        dbg!(current_bytes, elapsed_time);
+        let speed = current_bytes as f64 / elapsed_time / 1_000_000.0;
+
+        let progress: f64 = 1.0 - (handles.len() as f64 / total_items as f64);
+        println!(
+            "{:.5}% [{}/{}] item processed | Average Speed: {:.2} MB/s",
+            progress * 100.0,
+            total_items - handles.len(),
+            total_items,
+            speed
+        );
+        // time::sleep(Duration::from_millis(10)).await;
+    }
+    let total_bytes = Arc::clone(&size_counter);
+    let elapsed_time = start_time.elapsed().as_secs_f64();
+    let overall_speed = total_bytes.load(Ordering::SeqCst) as f64 / elapsed_time / 1_000_000.0;
+    println!("Overall Speed: {:.2} MB/s", overall_speed);
+    Ok(())
+}
+pub async fn parallel_library(library_list: Vec<Library>) -> Result<()> {
+    let library_list_arc: Arc<Vec<Library>> = Arc::new(library_list);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let size_counter = Arc::new(AtomicUsize::new(0));
+    let num_libraries = library_list_arc.len();
+
+    let mut library_download_handles = FuturesUnordered::new();
+    let push = Arc::new(AtomicBool::new(true));
+    for _ in 0..num_libraries {
+        let library_list_clone = Arc::clone(&library_list_arc);
+        let counter_clone = Arc::clone(&counter);
+        let size_clone = Arc::clone(&size_counter);
+        let push_clone = Arc::clone(&push);
+        let handle = tokio::spawn(async move {
+            let index = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if index < num_libraries {
+                let library = &library_list_clone[index];
+                if Path::new(&library.downloads.artifact.path).exists() {
+                    push_clone.store(false, Ordering::Release);
+                    test(format!("{} already downloaded!", library.name)).await
+                } else {
+                    download_library(library, size_clone).await
+                }
+            } else {
+                Ok(())
+            }
+        });
+        // "race condition"
+        time::sleep(Duration::from_millis(1)).await;
+        let push_clone = Arc::clone(&push);
+        if push_clone.load(Ordering::Acquire) {
+            library_download_handles.push(handle);
+        }
+        push_clone.store(true, Ordering::SeqCst);
+    }
+    parallel_join(&mut library_download_handles, &size_counter).await?;
+
+    Ok(())
+}
+async fn test(msg: String) -> Result<()> {
+    println!("{msg}");
+    std::future::ready("").await;
+    Ok(())
+}
+async fn download_file(
+    url: String,
+    name: Option<String>,
+    total_bytes: Arc<AtomicUsize>,
+) -> Result<()> {
     let mut response = reqwest::get(&url).await?;
     let filename = if let Some(x) = name {
         x.to_string()
@@ -219,15 +302,17 @@ async fn download_file(url: String, name: Option<String>) -> Result<()> {
     let mut file = File::create(&filename).await?;
     while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk).await?;
+        total_bytes.fetch_add(chunk.len() as usize, Ordering::Relaxed);
     }
     Ok(())
 }
-async fn download_library(library: &Library) -> Result<()> {
+
+async fn download_library(library: &Library, total_bytes: Arc<AtomicUsize>) -> Result<()> {
     let path = library.downloads.artifact.path.to_string();
     let parent_dir = std::path::Path::new(&path).parent().unwrap();
     fs::create_dir_all(parent_dir).await?;
     let url = library.downloads.artifact.url.to_string();
-    download_file(url, Some(path)).await?;
+    download_file(url, Some(path), total_bytes).await?;
     Ok(())
 }
 
