@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicUsize, atomic::Ordering, Arc},
+};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
-    join, spawn,
 };
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -167,15 +169,28 @@ async fn main() -> Result<()> {
         serde_json::from_value(contents["mainClass"].take()).context("Failed to get MainClass")?;
 
     use futures::stream::{FuturesUnordered, StreamExt};
-    use tokio::task;
 
-    let library_list_clone = library_list.leak();
+    let library_list: Arc<Vec<Library>> = Arc::new(library_list);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let num_libraries = library_list.len();
+
     let mut library_download_handles = FuturesUnordered::new();
-    for x in library_list_clone.iter() {
-        let handle = task::spawn(async move { download_library(&x).await });
+    for _ in 0..num_libraries {
+        let library_list_clone = Arc::clone(&library_list);
+        let counter_clone = Arc::clone(&counter);
+        let handle = tokio::spawn(async move {
+            let index = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if index < num_libraries {
+                let library = &library_list_clone[index];
+                download_library(library).await
+            } else {
+                Ok(())
+            }
+        });
         library_download_handles.push(handle);
     }
     let total_file_downloads = library_download_handles.len();
+
     while let Some(handle) = library_download_handles.next().await {
         handle??;
         let progress: f64 =
