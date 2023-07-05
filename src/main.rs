@@ -1,8 +1,13 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+    join, spawn,
+};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum ActionType {
@@ -51,16 +56,16 @@ struct JvmFlags {
 struct AssetIndex {
     id: String,
     sha1: String,
-    size: u64,
+    size: usize,
     #[serde(rename = "totalSize")]
-    total_size: u64,
+    total_size: usize,
     url: String,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
 struct DownloadMetadata {
     sha1: String,
-    size: u64,
+    size: usize,
     url: String,
 }
 
@@ -71,7 +76,44 @@ struct Downloads {
     server: DownloadMetadata,
     server_mappings: DownloadMetadata,
 }
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+struct LoggingConfig {
+    client: ClientConfig,
+}
 
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+struct ClientConfig {
+    argument: String,
+    file: LogFile,
+    #[serde(rename = "type")]
+    log_type: String,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+struct LogFile {
+    id: String,
+    sha1: String,
+    size: usize,
+    url: String,
+}
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct LibraryMetadata {
+    path: String,
+    sha1: String,
+    size: usize,
+    url: String,
+}
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct LibraryArtifact {
+    artifact: LibraryMetadata,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Library {
+    downloads: LibraryArtifact,
+    name: String,
+    rules: Option<Vec<Rule>>,
+}
 fn get_rules(argument: &mut [Value]) -> Result<Vec<Rule>> {
     let rules: Result<Vec<Rule>, _> = argument
         .iter_mut()
@@ -116,7 +158,74 @@ async fn main() -> Result<()> {
 
     let downloads_list: Downloads = serde_json::from_value(contents["downloads"].take())
         .context("Failed to Serialize Downloads")?;
+    let library_list: Vec<Library> = serde_json::from_value(contents["libraries"].take())?;
 
-    dbg!(downloads_list, asset_index, game_flags, jvm_flags);
+    let logging: LoggingConfig = serde_json::from_value(contents["logging"].take())
+        .context("Failed to Serialize logging")?;
+
+    let main_class: String =
+        serde_json::from_value(contents["mainClass"].take()).context("Failed to get MainClass")?;
+
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use tokio::task;
+
+    let library_list_clone = library_list.leak();
+    let mut library_download_handles = FuturesUnordered::new();
+    for x in library_list_clone.iter() {
+        let handle = task::spawn(async move { download_library(&x).await });
+        library_download_handles.push(handle);
+    }
+    let total_file_downloads = library_download_handles.len();
+    while let Some(handle) = library_download_handles.next().await {
+        handle??;
+        let progress: f64 =
+            1.0 - (library_download_handles.len() as f64 / total_file_downloads as f64);
+        println!(
+            "{:.5}% [{}/{}] file processed",
+            progress * 100.0,
+            total_file_downloads - library_download_handles.len(),
+            total_file_downloads
+        );
+    }
+    // let list_future = download_file(downloads_list.client.url, None);
+    // let asset_future = download_file(asset_index.url, Some(generate_unique_filename()));
+    // let test_future = download_file(downloads_list.server.url, None);
+    // let _ = join!(list_future, asset_future, test_future);
     Ok(())
+}
+
+async fn download_file(url: String, name: Option<String>) -> Result<()> {
+    let mut response = reqwest::get(&url).await?;
+    let filename = if let Some(x) = name {
+        x.to_string()
+    } else {
+        extract_filename(&url).unwrap()
+    };
+    let mut file = File::create(&filename).await?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    Ok(())
+}
+async fn download_library(library: &Library) -> Result<()> {
+    let path = library.downloads.artifact.path.to_string();
+    let parent_dir = std::path::Path::new(&path).parent().unwrap();
+    fs::create_dir_all(parent_dir).await?;
+    let url = library.downloads.artifact.url.to_string();
+    download_file(url, Some(path)).await?;
+    Ok(())
+}
+
+fn generate_unique_filename() -> String {
+    // Generate a unique filename, such as using a timestamp or a random identifier
+    // For simplicity, this example uses a timestamp-based filename
+    let timestamp = chrono::Utc::now().timestamp();
+    format!("file_{}.txt", timestamp)
+}
+
+fn extract_filename(url: &String) -> Result<String, Box<dyn std::error::Error>> {
+    let parsed_url = Url::parse(url)?;
+    let path_segments = parsed_url.path_segments().ok_or("Invalid URL")?;
+    let filename = path_segments.last().ok_or("No filename found in URL")?;
+    Ok(filename.to_string())
 }
