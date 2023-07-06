@@ -213,22 +213,34 @@ async fn main() -> Result<()> {
     pb.set_position(0);
     let pb_pass = Arc::new(pb);
     let pb_clone = pb_pass.clone();
-    let (mut handles, total_size) = parallel_library(library_list, pb_pass).await;
+    let current_size = Arc::new(AtomicUsize::new(0));
+    let list_future = download_file(
+        downloads_list.client.url,
+        None,
+        current_size.clone(),
+        pb_clone.clone(),
+    );
+    let asset_future = download_file(
+        asset_index.url,
+        Some(generate_unique_filename().into()),
+        current_size.clone(),
+        pb_clone.clone(),
+    );
+    let library_path = Arc::new(PathBuf::from("library"));
+    let (mut handles, total_size, current) =
+        parallel_library(library_list, pb_pass, library_path).await;
     pb_clone.set_length(total_size.load(Ordering::SeqCst).try_into().unwrap());
-
+    pb_clone.inc_length(
+        (downloads_list.client.size + asset_index.size)
+            .try_into()
+            .unwrap(),
+    );
+    handles.push(tokio::spawn(async move { list_future.await }));
+    handles.push(tokio::spawn(async move { asset_future.await }));
     parallel_join(&mut handles).await?;
-    // let current_size = Arc::new(AtomicUsize::new(0));
-    // let list_future = download_file(downloads_list.client.url, None, current_size.clone());
-    // let asset_future = download_file(
-    //     asset_index.url,
-    //     Some(generate_unique_filename()),
-    //     current_size.clone(),
-    // );
     // let _ = join!(list_future, asset_future, test_future);
 
     // let mut handles = FuturesUnordered::new();
-    // handles.push(tokio::spawn(async move { list_future.await }));
-    // handles.push(tokio::spawn(async move { asset_future.await }));
     // pb.set_style(ProgressStyle::default_bar()
     //     .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})").unwrap()
     //     .progress_chars("#>-"));
@@ -284,8 +296,10 @@ pub async fn parallel_join(
 pub async fn parallel_library(
     library_list: Vec<Library>,
     pb: Arc<ProgressBar>,
+    folder: Arc<PathBuf>,
 ) -> (
     FuturesUnordered<tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>>,
+    Arc<AtomicUsize>,
     Arc<AtomicUsize>,
 ) {
     let library_list_arc: Arc<Vec<Library>> = Arc::new(library_list);
@@ -304,10 +318,12 @@ pub async fn parallel_library(
         let size_clone = Arc::clone(&size_counter);
         let push_clone = Arc::clone(&push);
         let pb_clone = Arc::clone(&pb);
+        let folder = Arc::clone(&folder);
         let index = counter2_clone.fetch_add(1, Ordering::SeqCst);
         if index < num_libraries {
             let library = &library_list_clone[index];
-            if !Path::new(&library.downloads.artifact.path).exists() {
+            let final_path = folder.join(library.downloads.artifact.path.to_string());
+            if !final_path.exists() {
                 download_total_size.fetch_add(library.downloads.artifact.size, Ordering::SeqCst);
             }
         }
@@ -315,11 +331,12 @@ pub async fn parallel_library(
             let index = counter_clone.fetch_add(1, Ordering::SeqCst);
             if index < num_libraries {
                 let library = &library_list_clone[index];
-                if Path::new(&library.downloads.artifact.path).exists() {
+                let final_path = folder.join(library.downloads.artifact.path.to_string());
+                if final_path.exists() {
                     push_clone.store(false, Ordering::Release);
                     test(format!("{} already downloaded!", library.name)).await
                 } else {
-                    download_library(library, size_clone, pb_clone).await
+                    download_library(library, size_clone, pb_clone, folder).await
                 }
             } else {
                 Ok(())
@@ -334,7 +351,7 @@ pub async fn parallel_library(
         push_clone.store(true, Ordering::SeqCst);
     }
 
-    (library_download_handles, download_total_size)
+    (library_download_handles, download_total_size, size_counter)
 }
 async fn test(msg: String) -> Result<()> {
     println!("{msg}");
@@ -343,13 +360,13 @@ async fn test(msg: String) -> Result<()> {
 }
 async fn download_file(
     url: String,
-    name: Option<String>,
+    name: Option<PathBuf>,
     total_bytes: Arc<AtomicUsize>,
     pb: Arc<ProgressBar>,
 ) -> Result<()> {
     let mut response = reqwest::get(&url).await?;
     let filename = if let Some(x) = name {
-        x.to_string()
+        x.to_str().unwrap().to_string()
     } else {
         extract_filename(&url).unwrap()
     };
@@ -366,8 +383,10 @@ async fn download_library(
     library: &Library,
     total_bytes: Arc<AtomicUsize>,
     pb: Arc<ProgressBar>,
+    folder: Arc<PathBuf>,
 ) -> Result<()> {
     let path = library.downloads.artifact.path.to_string();
+    let path = folder.join(path);
     let parent_dir = std::path::Path::new(&path).parent().unwrap();
     fs::create_dir_all(parent_dir).await?;
     let url = library.downloads.artifact.url.to_string();
