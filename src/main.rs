@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
-use futures::{io::empty, stream::FuturesUnordered, Stream, StreamExt};
+use async_semaphore::Semaphore;
+use futures::{stream::FuturesUnordered, StreamExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::Ordering,
         atomic::{AtomicBool, AtomicUsize},
         Arc,
     },
-    thread::{self, JoinHandle},
     time::Duration,
 };
 use tokio::{
@@ -28,7 +28,7 @@ enum ActionType {
     Disallow,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
 enum OsName {
     #[serde(rename = "osx")]
     Osx,
@@ -206,124 +206,185 @@ async fn main() -> Result<()> {
         library_directory: "./".to_string(),
         game_directory: "~/.minecraft".to_string(),
     };
-    let pb = ProgressBar::new(0);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})").unwrap()
-        .progress_chars("#>-"));
-    pb.set_position(0);
-    let pb_pass = Arc::new(pb);
-    let pb_clone = pb_pass.clone();
+
     let current_size = Arc::new(AtomicUsize::new(0));
-    let list_future = download_file(
-        downloads_list.client.url,
-        None,
-        current_size.clone(),
-        pb_clone.clone(),
-    );
-    let asset_future = download_file(
-        asset_index.url,
-        Some(generate_unique_filename().into()),
-        current_size.clone(),
-        pb_clone.clone(),
-    );
     let library_path = Arc::new(PathBuf::from("library"));
-    let (mut handles, total_size, current) =
-        parallel_library(library_list, pb_pass, library_path).await;
-    pb_clone.set_length(total_size.load(Ordering::SeqCst).try_into().unwrap());
-    pb_clone.inc_length(
-        (downloads_list.client.size + asset_index.size)
-            .try_into()
-            .unwrap(),
-    );
-    handles.push(tokio::spawn(async move { list_future.await }));
-    handles.push(tokio::spawn(async move { asset_future.await }));
+    let (mut handles, total_size) =
+        parallel_library(library_list, library_path, Arc::clone(&current_size)).await;
+
+    let client_jar_future =
+        download_file(downloads_list.client.url, None, Arc::clone(&current_size));
+    handles.push(tokio::spawn(async move { client_jar_future.await }));
+    total_size.fetch_add(downloads_list.client.size, Ordering::Relaxed);
+
+    let (asset_download_list, asset_download_path, asset_download_size) =
+        asset_extraction(asset_index).await?;
+
+    let max_concurrent_tasks = 200;
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
+
+    let asset_download_list_arc = Arc::new(asset_download_list);
+    let asset_download_path_arc = Arc::new(asset_download_path);
+    let asset_download_size_arc = Arc::new(asset_download_size);
+
+    parallel_assets(
+        asset_download_list_arc,
+        asset_download_path_arc,
+        asset_download_size_arc,
+        &semaphore,
+        &current_size,
+        &total_size,
+        &mut handles,
+    )
+    .await?;
+
+    let download_complete = Arc::new(AtomicBool::new(false));
+    let download_complete_clone = Arc::clone(&download_complete);
+    let current_size_clone = Arc::clone(&current_size);
+    let instant = Instant::now();
+    let task = tokio::spawn(async move {
+        while !download_complete_clone.load(Ordering::Acquire) {
+            time::sleep(Duration::from_millis(10)).await;
+            // dbg!(current_size_clone.load(Ordering::Relaxed) as f64 / total_size as f64);
+            println!(
+                "{:.2}%, {:.2} MiBs, {}/{}",
+                current_size_clone.load(Ordering::Relaxed) as f64
+                    / total_size.load(Ordering::Relaxed) as f64
+                    * 100.0,
+                current_size_clone.load(Ordering::Relaxed) as f64
+                    / instant.elapsed().as_secs_f64()
+                    / 1_000_000.0,
+                current_size_clone.load(Ordering::Relaxed),
+                total_size.load(Ordering::Relaxed)
+            );
+            // time::sleep(Duration::from_millis(15)).await;
+        }
+        download_complete_clone.store(true, Ordering::SeqCst);
+        // std::future::ready(Ok(())).await
+    });
+
     parallel_join(&mut handles).await?;
-    // let _ = join!(list_future, asset_future, test_future);
 
-    // let mut handles = FuturesUnordered::new();
-    // pb.set_style(ProgressStyle::default_bar()
-    //     .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})").unwrap()
-    //     .progress_chars("#>-"));
-    // pb.set_position(0);
-
-    // parallel_join(&mut handles, &current_size, pb).await?;
+    // I'm not sure completely how this works... but it certainly does!
+    download_complete.store(true, Ordering::Release);
+    task.await?;
     Ok(())
 }
 
-use indicatif::{ProgressBar, ProgressStyle};
+async fn parallel_assets(
+    asset_download_list: Arc<Vec<String>>,
+    asset_download_path: Arc<Vec<PathBuf>>,
+    asset_download_size: Arc<Vec<usize>>,
+    semaphore: &Arc<Semaphore>,
+    current_size: &Arc<AtomicUsize>,
+    total_size: &Arc<AtomicUsize>,
+    handles: &mut FuturesUnordered<tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>>,
+) -> Result<()> {
+    for index in 0..asset_download_list.len() {
+        let asset_download_list_clone = Arc::clone(&asset_download_list);
+        let asset_download_path_clone = Arc::clone(&asset_download_path);
+        let semaphore_clone = Arc::clone(&semaphore);
+        let current_size_clone = Arc::clone(&current_size);
+        fs::create_dir_all(asset_download_path_clone[index].parent().unwrap()).await?;
+        if asset_download_path_clone[index].exists() {
+            println!(
+                "skip downloading asset {}",
+                asset_download_list_clone[index]
+            );
+        } else {
+            total_size.fetch_add(asset_download_size[index], Ordering::Relaxed);
+            handles.push(tokio::spawn(async move {
+                let _per = semaphore_clone.acquire().await;
+                download_file(
+                    asset_download_list_clone[index].to_string(),
+                    // I *could* fix this, but I'm lazy
+                    Some(asset_download_path_clone[index].clone()),
+                    current_size_clone,
+                )
+                .await
+            }));
+        }
+    }
+    Ok(())
+}
+
+async fn asset_extraction(
+    asset_index: AssetIndex,
+) -> Result<(Vec<String>, Vec<PathBuf>, Vec<usize>)> {
+    let asset_response = reqwest::get(asset_index.url).await?;
+    let asset_index_content: Value = asset_response.json().await?;
+    let asset_objects = asset_index_content["objects"].as_object().unwrap();
+    let mut asset_download_list = Vec::new();
+    let mut asset_download_path = Vec::new();
+    let mut asset_download_size: Vec<usize> = Vec::new();
+    for (_, val) in asset_objects {
+        asset_download_list.push(format!(
+            "https://resources.download.minecraft.net/{:.2}/{}",
+            val["hash"].as_str().unwrap(),
+            val["hash"].as_str().unwrap()
+        ));
+        asset_download_path.push(PathBuf::from(format!(
+            ".minecraft/assets/objects/{:.2}/{}",
+            val["hash"].as_str().unwrap(),
+            val["hash"].as_str().unwrap()
+        )));
+        asset_download_size.push(val["size"].as_u64().unwrap().try_into().unwrap());
+    }
+    Ok((
+        asset_download_list,
+        asset_download_path,
+        asset_download_size,
+    ))
+}
+
 pub async fn parallel_join(
     handles: &mut FuturesUnordered<tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>>,
     // size_counter: &Arc<AtomicUsize>,
     // size_sum: usize,
 ) -> Result<()> {
-    // let total_items = handles.len();
-    // let start_time = Instant::now();
-    // let pb = ProgressBar::new(size_sum.try_into().unwrap());
-    // let mut prev_bytes = size_counter.load(Ordering::SeqCst);
-
-    // pb.enable_steady_tick(Duration::from_millis(10));
-    // let total_bytes = Arc::clone(&size_counter);
-    // let current_bytes = total_bytes.load(Ordering::SeqCst);
     while let Some(handle) = handles.next().await {
-        handle.unwrap()?;
-        // let total_bytes = Arc::clone(&size_counter);
-        // let elapsed_time = start_time.elapsed().as_secs_f64();
-        // let current_bytes = total_bytes.load(Ordering::SeqCst);
-        // let speed = current_bytes as f64 / elapsed_time / 1_000_000.0;
-
-        // pb.set_position(current_bytes.try_into().unwrap());
-
-        // let progress: f64 = 1.0 - (handles.len() as f64 / total_items as f64);
-        // println!(
-        //     "{:.5}% [{}/{}] item processed | Average Speed: {:.2} MB/s",
-        //     progress * 100.0,
-        //     total_items - handles.len(),
-        //     total_items,
-        //     speed
-        // );
-
-        // pb.inc((current_bytes - prev_bytes).try_into().unwrap());
-
-        // prev_bytes = current_bytes;
-        // time::sleep(Duration::from_millis(10)).await;
+        handle??;
     }
-    // let total_bytes = Arc::clone(&size_counter);
-    // let elapsed_time = start_time.elapsed().as_secs_f64();
-    // let overall_speed = total_bytes.load(Ordering::SeqCst) as f64 / elapsed_time / 1_000_000.0;
-    // println!("Overall Speed: {:.2} MB/s", overall_speed);
     Ok(())
 }
 pub async fn parallel_library(
     library_list: Vec<Library>,
-    pb: Arc<ProgressBar>,
     folder: Arc<PathBuf>,
+    current: Arc<AtomicUsize>,
 ) -> (
     FuturesUnordered<tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>>,
     Arc<AtomicUsize>,
-    Arc<AtomicUsize>,
 ) {
     let library_list_arc: Arc<Vec<Library>> = Arc::new(library_list);
-    let counter = Arc::new(AtomicUsize::new(0));
-    let counter2 = Arc::new(AtomicUsize::new(0));
-    let size_counter = Arc::new(AtomicUsize::new(0));
+    let index_counter = Arc::new(AtomicUsize::new(0));
+    let index_spawn_counter = Arc::new(AtomicUsize::new(0));
+    let size_counter = current;
     let download_total_size = Arc::new(AtomicUsize::new(0));
+    let do_library_os = Arc::new(AtomicBool::new(false));
     let num_libraries = library_list_arc.len();
 
     let library_download_handles = FuturesUnordered::new();
     let push = Arc::new(AtomicBool::new(true));
+    let current_os = os_version::detect().unwrap();
+    let current_os_type = match current_os {
+        os_version::OsVersion::Linux(_) => OsName::Linux,
+        os_version::OsVersion::Windows(_) => OsName::Windows,
+        os_version::OsVersion::MacOS(_) => OsName::Osx,
+        _ => panic!("not supported"),
+    };
     for _ in 0..num_libraries {
         let library_list_clone = Arc::clone(&library_list_arc);
-        let counter_clone = Arc::clone(&counter);
-        let counter2_clone = Arc::clone(&counter2);
+        let counter_clone = Arc::clone(&index_counter);
+        let counter2_clone = Arc::clone(&index_spawn_counter);
         let size_clone = Arc::clone(&size_counter);
         let push_clone = Arc::clone(&push);
-        let pb_clone = Arc::clone(&pb);
         let folder = Arc::clone(&folder);
+        let do_library_clone = Arc::clone(&do_library_os);
         let index = counter2_clone.fetch_add(1, Ordering::SeqCst);
         if index < num_libraries {
             let library = &library_list_clone[index];
-            let final_path = folder.join(library.downloads.artifact.path.to_string());
-            if !final_path.exists() {
+            let final_path = folder.join(&library.downloads.artifact.path);
+            if !final_path.exists() || do_library_clone.load(Ordering::SeqCst) {
                 download_total_size.fetch_add(library.downloads.artifact.size, Ordering::SeqCst);
             }
         }
@@ -331,58 +392,65 @@ pub async fn parallel_library(
             let index = counter_clone.fetch_add(1, Ordering::SeqCst);
             if index < num_libraries {
                 let library = &library_list_clone[index];
-                let final_path = folder.join(library.downloads.artifact.path.to_string());
-                if final_path.exists() {
+                let final_path = folder.join(&library.downloads.artifact.path);
+                if let Some(rule) = &library.rules {
+                    for x in rule {
+                        if let Some(os) = &x.os {
+                            if let Some(name) = &os.name {
+                                if &current_os_type == name {
+                                    do_library_clone.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !do_library_clone.load(Ordering::SeqCst) {
+                    println!("{} is not required on", library.name);
+                    Ok(())
+                } else if final_path.exists() {
                     push_clone.store(false, Ordering::Release);
-                    test(format!("{} already downloaded!", library.name)).await
+                    println!("{} already downloaded!", library.name);
+                    Ok(())
                 } else {
-                    download_library(library, size_clone, pb_clone, folder).await
+                    download_library(library, size_clone, folder).await
                 }
             } else {
                 Ok(())
             }
         });
         // "race condition"
-        time::sleep(Duration::from_millis(1)).await;
+        // time::sleep(Duration::from_millis(5)).await;
         let push_clone = Arc::clone(&push);
-        if push_clone.load(Ordering::Acquire) {
+        if push_clone.load(Ordering::Acquire) || do_library_os.load(Ordering::Acquire) {
             library_download_handles.push(handle);
         }
         push_clone.store(true, Ordering::SeqCst);
+        do_library_os.store(false, Ordering::SeqCst);
     }
 
-    (library_download_handles, download_total_size, size_counter)
-}
-async fn test(msg: String) -> Result<()> {
-    println!("{msg}");
-    std::future::ready("").await;
-    Ok(())
+    (library_download_handles, download_total_size)
 }
 async fn download_file(
     url: String,
     name: Option<PathBuf>,
-    total_bytes: Arc<AtomicUsize>,
-    pb: Arc<ProgressBar>,
+    current_bytes: Arc<AtomicUsize>,
 ) -> Result<()> {
     let mut response = reqwest::get(&url).await?;
-    let filename = if let Some(x) = name {
-        x.to_str().unwrap().to_string()
-    } else {
-        extract_filename(&url).unwrap()
-    };
+    let filename = name.map_or_else(
+        || extract_filename(&url).unwrap(),
+        |x| x.to_str().unwrap().to_string(),
+    );
     let mut file = File::create(&filename).await?;
     while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk).await?;
-        pb.inc(chunk.len().try_into().unwrap());
-        // total_bytes.fetch_add(chunk.len() as usize, Ordering::Relaxed);
+        current_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
     }
     Ok(())
 }
 
 async fn download_library(
     library: &Library,
-    total_bytes: Arc<AtomicUsize>,
-    pb: Arc<ProgressBar>,
+    current_bytes: Arc<AtomicUsize>,
     folder: Arc<PathBuf>,
 ) -> Result<()> {
     let path = library.downloads.artifact.path.to_string();
@@ -390,18 +458,11 @@ async fn download_library(
     let parent_dir = std::path::Path::new(&path).parent().unwrap();
     fs::create_dir_all(parent_dir).await?;
     let url = library.downloads.artifact.url.to_string();
-    download_file(url, Some(path), total_bytes, pb).await?;
+    download_file(url, Some(path), current_bytes).await?;
     Ok(())
 }
 
-fn generate_unique_filename() -> String {
-    // Generate a unique filename, such as using a timestamp or a random identifier
-    // For simplicity, this example uses a timestamp-based filename
-    let timestamp = chrono::Utc::now().timestamp();
-    format!("file_{}.txt", timestamp)
-}
-
-fn extract_filename(url: &String) -> Result<String, Box<dyn std::error::Error>> {
+fn extract_filename(url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let parsed_url = Url::parse(url)?;
     let path_segments = parsed_url.path_segments().ok_or("Invalid URL")?;
     let filename = path_segments.last().ok_or("No filename found in URL")?;
