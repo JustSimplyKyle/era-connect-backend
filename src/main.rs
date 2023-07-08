@@ -3,7 +3,7 @@ use async_semaphore::Semaphore;
 use futures::{stream::FuturesUnordered, StreamExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{map::Values, Value};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -125,11 +125,11 @@ pub struct Library {
     name: String,
     rules: Option<Vec<Rule>>,
 }
-fn get_rules(argument: &mut [Value]) -> Result<Vec<Rule>> {
+fn get_rules(argument: &[Value]) -> Result<Vec<Rule>> {
     let rules: Result<Vec<Rule>, _> = argument
-        .iter_mut()
+        .iter()
         .filter(|x| x["rules"][0].is_object())
-        .map(|x| serde_json::from_value(x["rules"][0].take()))
+        .map(|x| Rule::deserialize(&x["rules"][0]))
         .collect();
 
     rules.context("Failed to collect/serialize rules")
@@ -151,9 +151,9 @@ use anyhow::anyhow;
 async fn main() -> Result<()> {
     let target = "https://piston-meta.mojang.com/v1/packages/715ccf3330885e75b205124f09f8712542cbe7e0/1.20.1.json";
     let response = reqwest::get(target).await?;
-    let mut contents: Value = response.json().await?;
+    let contents: Value = response.json().await?;
 
-    let game_argument = contents["arguments"]["game"].as_array_mut().ok_or(anyhow!(
+    let game_argument = contents["arguments"]["game"].as_array().ok_or(anyhow!(
         "Failure to parse contents[\"arguments\"][\"game\"]"
     ))?;
 
@@ -167,19 +167,20 @@ async fn main() -> Result<()> {
         additional_arguments: None,
     };
 
-    let asset_index: AssetIndex = serde_json::from_value(contents["assetIndex"].take())
+    let asset_index = AssetIndex::deserialize(&contents["assetIndex"])
         .context("Failed to Serialize assetIndex")?;
 
-    let downloads_list: Downloads = serde_json::from_value(contents["downloads"].take())
-        .context("Failed to Serialize Downloads")?;
+    let downloads_list: Downloads =
+        Downloads::deserialize(&contents["downloads"]).context("Failed to Serialize Downloads")?;
 
-    let library_list: Vec<Library> = serde_json::from_value(contents["libraries"].take())?;
+    let library_list: Vec<Library> = Vec::<Library>::deserialize(&contents["libraries"])
+        .context("Failed to Serialize contents[\"libraries\"]")?;
 
-    let logging: LoggingConfig = serde_json::from_value(contents["logging"].take())
-        .context("Failed to Serialize logging")?;
+    let logging: LoggingConfig =
+        LoggingConfig::deserialize(&contents["logging"]).context("Failed to Serialize logging")?;
 
     let main_class: String =
-        serde_json::from_value(contents["mainClass"].take()).context("Failed to get MainClass")?;
+        String::deserialize(&contents["mainClass"]).context("Failed to get MainClass")?;
 
     let client_jar = extract_filename(&downloads_list.client.url)?;
 
@@ -192,7 +193,7 @@ async fn main() -> Result<()> {
     let classpath = classpath_list.join(":");
 
     let jvm_argument = contents["arguments"]["jvm"]
-        .as_array_mut()
+        .as_array()
         .ok_or(anyhow!("Failure to parse contents[\"arguments\"][\"jvm\"]"))?;
     let jvm_flags = JvmFlags {
         rules: get_rules(jvm_argument)?,
@@ -213,7 +214,7 @@ async fn main() -> Result<()> {
         game_directory: "~/.minecraft".to_string(),
     };
 
-    let max_concurrent_tasks = 64;
+    let max_concurrent_tasks = 128;
     let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
 
     let current_size = Arc::new(AtomicUsize::new(0));
