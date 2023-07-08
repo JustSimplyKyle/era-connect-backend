@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use async_semaphore::Semaphore;
-use futures::{stream::FuturesUnordered, StreamExt};
+use core::fmt;
+use futures::{
+    stream::{FuturesOrdered, FuturesUnordered},
+    StreamExt,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{map::Values, Value};
 use std::{
+    borrow::BorrowMut,
     collections::HashMap,
     path::PathBuf,
     sync::{
@@ -16,7 +21,8 @@ use std::{
 };
 use tokio::{
     fs::{self, File},
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    sync::Mutex,
     time::{self, Instant},
 };
 
@@ -36,6 +42,15 @@ enum OsName {
     Windows,
     #[serde(rename = "linux")]
     Linux,
+}
+impl fmt::Display for OsName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Osx => write!(f, "Osx"),
+            Self::Windows => write!(f, "Windows"),
+            Self::Linux => write!(f, "Linux"),
+        }
+    }
 }
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Os {
@@ -149,13 +164,25 @@ use anyhow::anyhow;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let target = "https://piston-meta.mojang.com/v1/packages/715ccf3330885e75b205124f09f8712542cbe7e0/1.20.1.json";
+    let target = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
+    let response = reqwest::get(target).await?;
+    let version_manifest: Value = response.json().await?;
+    let latest_release = version_manifest["latest"]["release"].as_str();
+    let release_url = version_manifest["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_str() == latest_release)
+        .unwrap()["url"]
+        .as_str()
+        .unwrap();
+    let target = release_url;
     let response = reqwest::get(target).await?;
     let contents: Value = response.json().await?;
 
-    let game_argument = contents["arguments"]["game"].as_array().ok_or(anyhow!(
-        "Failure to parse contents[\"arguments\"][\"game\"]"
-    ))?;
+    let game_argument = contents["arguments"]["game"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Failure to parse contents[\"arguments\"][\"game\"]"))?;
 
     let game_flags = GameFlags {
         rules: get_rules(game_argument)?,
@@ -194,7 +221,7 @@ async fn main() -> Result<()> {
 
     let jvm_argument = contents["arguments"]["jvm"]
         .as_array()
-        .ok_or(anyhow!("Failure to parse contents[\"arguments\"][\"jvm\"]"))?;
+        .ok_or_else(|| anyhow!("Failure to parse contents[\"arguments\"][\"jvm\"]"))?;
     let jvm_flags = JvmFlags {
         rules: get_rules(jvm_argument)?,
         arguments: jvm_argument
@@ -214,7 +241,7 @@ async fn main() -> Result<()> {
         game_directory: "~/.minecraft".to_string(),
     };
 
-    let max_concurrent_tasks = 128;
+    let max_concurrent_tasks = 64;
     let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
 
     let current_size = Arc::new(AtomicUsize::new(0));
@@ -227,20 +254,38 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let client_jar_future =
-        download_file(downloads_list.client.url, None, Arc::clone(&current_size));
-    total_size.fetch_add(downloads_list.client.size, Ordering::Relaxed);
-    handles.push(tokio::spawn(async move { client_jar_future.await }));
+    let client_download = || {
+        let client_jar_future = download_file(
+            downloads_list.client.url.to_string(),
+            None,
+            Arc::clone(&current_size),
+        );
+        total_size.fetch_add(downloads_list.client.size, Ordering::Relaxed);
+        handles.push(tokio::spawn(async move { client_jar_future.await }));
+    };
 
-    let (asset_download_list, asset_download_path, asset_download_size) =
+    if !PathBuf::from(extract_filename(&downloads_list.client.url)?).exists() {
+        client_download();
+    } else if let Err(x) = validate_sha1(
+        &PathBuf::from(&extract_filename(&downloads_list.client.url)?),
+        &downloads_list.client.sha1,
+    )
+    .await
+    {
+        eprintln!("{x}");
+        client_download();
+    }
+    let (asset_download_list, asset_download_hash, asset_download_path, asset_download_size) =
         extract_assets(asset_index).await?;
 
     let asset_download_list_arc = Arc::new(asset_download_list);
+    let asset_download_hash_arc = Arc::new(asset_download_hash);
     let asset_download_path_arc = Arc::new(asset_download_path);
     let asset_download_size_arc = Arc::new(asset_download_size);
 
     parallel_assets(
         asset_download_list_arc,
+        asset_download_hash_arc,
         asset_download_path_arc,
         asset_download_size_arc,
         &semaphore,
@@ -257,17 +302,21 @@ async fn main() -> Result<()> {
     let task = tokio::spawn(async move {
         while !download_complete_clone.load(Ordering::Acquire) {
             time::sleep(Duration::from_millis(10)).await;
-            println!(
-                "{:.2}%, {:.2} MiBs, {}/{}",
-                current_size_clone.load(Ordering::Relaxed) as f64
-                    / total_size.load(Ordering::Relaxed) as f64
-                    * 100.0,
-                current_size_clone.load(Ordering::Relaxed) as f64
-                    / instant.elapsed().as_secs_f64()
-                    / 1_000_000.0,
-                current_size_clone.load(Ordering::Relaxed),
-                total_size.load(Ordering::Relaxed)
-            );
+            if total_size.load(Ordering::Relaxed) == 0 {
+                println!("everything has been downloaded!");
+            } else {
+                println!(
+                    "{:.2}%, {:.2} MiBs, {}/{}",
+                    current_size_clone.load(Ordering::Relaxed) as f64
+                        / total_size.load(Ordering::Relaxed) as f64
+                        * 100.0,
+                    current_size_clone.load(Ordering::Relaxed) as f64
+                        / instant.elapsed().as_secs_f64()
+                        / 1_000_000.0,
+                    current_size_clone.load(Ordering::Relaxed),
+                    total_size.load(Ordering::Relaxed)
+                );
+            }
         }
     });
 
@@ -280,6 +329,7 @@ async fn main() -> Result<()> {
 
 async fn parallel_assets(
     asset_download_list: Arc<Vec<String>>,
+    asset_download_hash: Arc<Vec<String>>,
     asset_download_path: Arc<Vec<PathBuf>>,
     asset_download_size: Arc<Vec<usize>>,
     semaphore: &Arc<Semaphore>,
@@ -290,20 +340,31 @@ async fn parallel_assets(
     for index in 0..asset_download_list.len() {
         let asset_download_list_clone = Arc::clone(&asset_download_list);
         let asset_download_path_clone = Arc::clone(&asset_download_path);
-        let semaphore_clone = Arc::clone(&semaphore);
-        let current_size_clone = Arc::clone(&current_size);
+        let semaphore_clone = Arc::clone(semaphore);
+        let current_size_clone = Arc::clone(current_size);
         fs::create_dir_all(
             asset_download_path_clone[index]
                 .parent()
-                .ok_or(anyhow!("can't find asset_download's parent dir"))?,
+                .ok_or_else(|| anyhow!("can't find asset_download's parent dir"))?,
         )
         .await?;
-        if asset_download_path_clone[index].exists() {
-            // println!(
-            //     "already downloaded asset {}",
-            //     asset_download_list_clone[index]
-            // );
+        let okto_download = if asset_download_path_clone[index].exists() {
+            if let Err(x) = validate_sha1(
+                &asset_download_path_clone[index],
+                &asset_download_hash[index],
+            )
+            .await
+            {
+                eprintln!("{x}, \nredownloading.");
+                true
+            } else {
+                false
+            }
         } else {
+            true
+        };
+        // if !asset_download_path[index].exists() || broken_hash_vec.lock().await[index] {
+        if okto_download {
             total_size.fetch_add(asset_download_size[index], Ordering::Relaxed);
             handles.push(tokio::spawn(async move {
                 let _permit = semaphore_clone.acquire().await;
@@ -319,16 +380,42 @@ async fn parallel_assets(
     }
     Ok(())
 }
+async fn validate_sha1(file_path: &PathBuf, sha1: &str) -> Result<()> {
+    use sha1::{Digest, Sha1};
+    let mut file = File::open(file_path).await?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+
+    let mut hasher = Sha1::new();
+    hasher.update(&buffer);
+    let result = &hasher.finalize()[..];
+
+    if result != hex::decode(sha1)? {
+        return Err(anyhow!(
+            r#"
+{} hash don't fit!
+get: {}
+expected: {}
+"#,
+            file_path.to_string_lossy(),
+            hex::encode(result),
+            sha1
+        ));
+    }
+
+    Ok(())
+}
 
 async fn extract_assets(
     asset_index: AssetIndex,
-) -> Result<(Vec<String>, Vec<PathBuf>, Vec<usize>)> {
+) -> Result<(Vec<String>, Vec<String>, Vec<PathBuf>, Vec<usize>)> {
     let asset_response = reqwest::get(asset_index.url).await?;
     let asset_index_content: Value = asset_response.json().await?;
     let asset_objects = asset_index_content["objects"]
         .as_object()
-        .ok_or(anyhow!("Failure to parse asset_index_content[\"objects\"]"))?;
+        .ok_or_else(|| anyhow!("Failure to parse asset_index_content[\"objects\"]"))?;
     let mut asset_download_list = Vec::new();
+    let mut asset_download_hash = Vec::new();
     let mut asset_download_path = Vec::new();
     let mut asset_download_size: Vec<usize> = Vec::new();
     for (_, val) in asset_objects {
@@ -336,29 +423,36 @@ async fn extract_assets(
             "https://resources.download.minecraft.net/{:.2}/{}",
             val["hash"]
                 .as_str()
-                .ok_or(anyhow!("asset hash is not a string"))?,
+                .ok_or_else(|| anyhow!("asset hash is not a string"))?,
             val["hash"]
                 .as_str()
-                .ok_or(anyhow!("asset hash is not a string"))?,
+                .ok_or_else(|| anyhow!("asset hash is not a string"))?,
         ));
+        asset_download_hash.push(
+            val["hash"]
+                .as_str()
+                .ok_or_else(|| anyhow!("asset hash is not a string"))?
+                .to_string(),
+        );
         asset_download_path.push(PathBuf::from(format!(
             ".minecraft/assets/objects/{:.2}/{}",
             val["hash"]
                 .as_str()
-                .ok_or(anyhow!("asset hash is not a string"))?,
+                .ok_or_else(|| anyhow!("asset hash is not a string"))?,
             val["hash"]
                 .as_str()
-                .ok_or(anyhow!("asset hash is not a string"))?,
+                .ok_or_else(|| anyhow!("asset hash is not a string"))?,
         )));
         asset_download_size.push(
             val["size"]
                 .as_u64()
-                .ok_or(anyhow!("asset size is not u64"))?
+                .ok_or_else(|| anyhow!("asset size is not u64"))?
                 .try_into()?,
         );
     }
     Ok((
         asset_download_list,
+        asset_download_hash,
         asset_download_path,
         asset_download_size,
     ))
@@ -366,8 +460,6 @@ async fn extract_assets(
 
 pub async fn parallel_join(
     handles: &mut FuturesUnordered<tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>>,
-    // size_counter: &Arc<AtomicUsize>,
-    // size_sum: usize,
 ) -> Result<()> {
     while let Some(handle) = handles.next().await {
         handle??;
@@ -410,24 +502,42 @@ pub async fn parallel_library(
             let index = counter_clone.fetch_add(1, Ordering::SeqCst);
             if index < num_libraries {
                 let library = &library_list_clone[index];
-                let final_path = folder.join(&library.downloads.artifact.path);
-                let mut download = false;
-                if let Some(rule) = &library.rules {
-                    for x in rule {
-                        if let Some(os) = &x.os {
-                            if let Some(name) = &os.name {
-                                if &current_os_type == name {
-                                    download = true;
+                let mut os_okto_download = false;
+                let path = library.downloads.artifact.path.to_string();
+                let path = folder.join(path);
+                match &library.rules {
+                    Some(rule) => {
+                        for x in rule {
+                            if let Some(os) = &x.os {
+                                if let Some(name) = &os.name {
+                                    if &current_os_type == name {
+                                        match x.action {
+                                            ActionType::Allow => os_okto_download = true,
+                                            ActionType::Disallow => os_okto_download = false,
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    None => {
+                        os_okto_download = true;
+                    }
                 }
-                if !download {
-                    println!("{} is not required on", library.name);
+                let okto_download = if path.exists() {
+                    if let Err(x) = validate_sha1(&path, &library.downloads.artifact.sha1).await {
+                        eprintln!("{x}, \nredownloading.");
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                if !os_okto_download {
+                    println!("{} is not required on {}", library.name, current_os_type);
                     Ok(())
-                } else if final_path.exists() {
-                    println!("{} already downloaded!", library.name);
+                } else if !okto_download {
                     Ok(())
                 } else {
                     download_total_size_clone
@@ -448,11 +558,11 @@ async fn download_file(
     name: Option<&PathBuf>,
     current_bytes: Arc<AtomicUsize>,
 ) -> Result<()> {
-    let mut response = reqwest::get(&url).await?;
     let filename = name.map_or_else(
         || extract_filename(&url).unwrap(),
         |x| x.to_str().unwrap().to_string(),
     );
+    let mut response = reqwest::get(&url).await?;
     let mut file = File::create(&filename).await?;
     while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk).await?;
@@ -477,9 +587,11 @@ async fn download_library(
 
 fn extract_filename(url: &str) -> Result<String> {
     let parsed_url = Url::parse(url)?;
-    let path_segments = parsed_url.path_segments().ok_or(anyhow!("Invalid URL"))?;
+    let path_segments = parsed_url
+        .path_segments()
+        .ok_or_else(|| anyhow!("Invalid URL"))?;
     let filename = path_segments
         .last()
-        .ok_or(anyhow!("No filename found in URL"))?;
+        .ok_or_else(|| anyhow!("No filename found in URL"))?;
     Ok(filename.to_string())
 }
